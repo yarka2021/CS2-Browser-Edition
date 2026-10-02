@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dust Arena</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #171b20;
+      color: #fff4db;
+      font-family: Consolas, monospace;
+    }
+    canvas { display: block; }
+    #hud {
+      position: fixed;
+      left: 24px;
+      right: 24px;
+      bottom: 24px;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      pointer-events: none;
+      font-size: clamp(14px, 2vw, 21px);
+      text-shadow: 0 2px 5px #000;
+    }
+    #score {
+      position: fixed;
+      top: 22px;
+      width: 100%;
+      text-align: center;
+      pointer-events: none;
+      letter-spacing: 2px;
+      text-shadow: 0 2px 5px #000;
+    }
+    #crosshair {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      color: #bcffb0;
+      font-size: 25px;
+      pointer-events: none;
+    }
+    #overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 5;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, #101921ed, #433225da);
+    }
+    .panel {
+      width: min(560px, 92vw);
+      padding: 38px;
+      border-left: 4px solid #ffc66b;
+      background: #111a23e8;
+      box-shadow: 0 30px 100px #0008;
+    }
+    .label { color: #ffc66b; letter-spacing: 5px; font-size: 12px; }
+    h1 {
+      margin: 16px 0;
+      font-family: Impact, "Arial Narrow", sans-serif;
+      font-size: clamp(44px, 9vw, 70px);
+      font-weight: normal;
+      line-height: .95;
+      text-transform: uppercase;
+    }
+    p { line-height: 1.7; color: #c6c9c9; }
+    button {
+      border: 0;
+      padding: 16px 26px;
+      background: #ffc66b;
+      color: #18212a;
+      font: bold 17px Consolas, monospace;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: wait; }
+    #damage {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      box-shadow: inset 0 0 120px #ef352a;
+      opacity: 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="score"></div>
+  <div id="crosshair">+</div>
+  <div id="hud">
+    <span id="health"></span>
+    <span id="ammo"></span>
+  </div>
+  <div id="damage"></div>
+  <div id="overlay">
+    <div class="panel">
+      <div class="label">TACTICAL / TRAINING</div>
+      <h1 id="title">Dust Arena</h1>
+      <p id="message">
+        WASD — движение · Мышь — обзор<br>
+        ЛКМ — огонь · R — перезарядка<br>
+        Пробел — прыжок · C — присесть<br>
+        Shift — бег · Esc — пауза<br><br>
+        Уничтожь всех ботов за 90 секунд.<br>
+        Нужны клавиатура и мышь.
+      </p>
+      <button id="start" disabled>Загрузка...</button>
+    </div>
+  </div>
+
+  <script type="module">
+    const $ = id => document.getElementById(id);
+    const start = $("start");
+    const overlay = $("overlay");
+
+    try {
+      const THREE = await import(
+        "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js"
+      );
+      boot(THREE);
+    } catch (error) {
+      $("title").textContent = "Ошибка запуска";
+      $("message").textContent =
+        "Не удалось загрузить игру. Проверь интернет, доступ к CDN " +
+        "и поддержку WebGL. Подробности — в консоли браузера.";
+      start.textContent = "Недоступно";
+      start.disabled = true;
+      console.error(error);
+    }
+
+    function boot(T) {
+      const scene = new T.Scene();
+      scene.background = new T.Color(0xa6bbc0);
+      scene.fog = new T.Fog(0xa6bbc0, 25, 65);
+
+      const camera = new T.PerspectiveCamera(
+        75, innerWidth / innerHeight, 0.05, 100
+      );
+      camera.rotation.order = "YXZ";
+      scene.add(camera);
+
+      const renderer = new T.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.shadowMap.enabled = true;
+      document.body.prepend(renderer.domElement);
+
+      scene.add(new T.HemisphereLight(0xd6f3ff, 0x68523c, 2));
+      const sun = new T.DirectionalLight(0xffe4b5, 3);
+      sun.position.set(12, 22, 8);
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(2048, 2048);
+      Object.assign(sun.shadow.camera, {
+        left: -24, right: 24, top: 24, bottom: -24, far: 70
+      });
+      scene.add(sun);
+
+      const walls = [];
+      const bounds = [];
+      const bots = [];
+      const keys = new Set();
+      const ray = new T.Raycaster();
+      const direction = new T.Vector3();
+      const up = new T.Vector3(0, 1, 0);
+      let active = false;
+      let finished = true;
+      let firing = false;
+      let hp = 100;
+      let ammo = 30;
+      let reserve = 120;
+      let reload = 0;
+      let cooldown = 0;
+      let remaining = 90;
+      let round = 0;
+      let verticalSpeed = 0;
+      let foot = 0;
+      let damageFlash = 0;
+      let hitFlash = 0;
+      let recoil = 0;
+
+      function box(w, h, d, color, x, y, z, parent = scene) {
+        const mesh = new T.Mesh(
+          new T.BoxGeometry(w, h, d),
+          new T.MeshStandardMaterial({ color, roughness: .88 })
+        );
+        mesh.position.set(x, y, z);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        parent.add(mesh);
+        return mesh;
+      }
+
+      box(42, .4, 42, 0xb5a17d, 0, -.2, 0);
+
+      function wall(x, z, w, d, h = 3.4, color = 0xc5ad84) {
+        const mesh = box(w, h, d, color, x, h / 2, z);
+        walls.push(mesh);
+        bounds.push({ x, z, w: w / 2, d: d / 2 });
+      }
+
+      wall(-20, 0, 1, 41, 5);
+      wall(20, 0, 1, 41, 5);
+      wall(0, -20, 41, 1, 5);
+      wall(0, 20, 41, 1, 5);
+      wall(-7, 2, 5, 4);
+      wall(7, -4, 5, 4);
+      wall(-7, -10, 4, 3);
+      wall(7, 10, 4, 3);
+      wall(0, -3, 2.5, 3, 2.8, 0x67766d);
+      wall(-13, 10, 3, 3, 2.8, 0x67766d);
+      wall(13, -12, 3, 3, 2.8, 0x67766d);
+
+      const grid = new T.GridHelper(40, 20, 0x8e7d62, 0xa59270);
+      grid.position.y = .012;
+      scene.add(grid);
+
+      const gun = new T.Group();
+      camera.add(gun);
+      gun.position.set(.28, -.27, -.55);
+      box(.14, .16, .48, 0x252c30, 0, 0, 0, gun);
+      box(.06, .06, .35, 0x131719, 0, .035, -.36, gun);
+      box(.08, .2, .12, 0x554532, 0, -.13, .08, gun);
+      const muzzle = box(.11, .11, .13, 0xffd075, 0, .035, -.59, gun);
+      muzzle.material = new T.MeshBasicMaterial({ color: 0xffd075 });
+      muzzle.visible = false;
+
+      const bodyGeometry = new T.BoxGeometry(.7, 1.12, .48);
+      const headGeometry = new T.BoxGeometry(.42, .42, .42);
+      const bodyMaterial = new T.MeshStandardMaterial({ color: 0x9d4934 });
+      const headMaterial = new T.MeshStandardMaterial({ color: 0xe0bc8d });
+
+      function spawnBot(x, z) {
+        const group = new T.Group();
+        group.position.set(x, 0, z);
+        scene.add(group);
+        const bot = {
+          group, hp: 100, timer: 1 + Math.random(), parts: [],
+          side: Math.random() < .5 ? -1 : 1
+        };
+        for (const [geometry, material, y, head] of [
+          [bodyGeometry, bodyMaterial, .91, false],
+          [headGeometry, headMaterial, 1.68, true]
+        ]) {
+          const mesh = new T.Mesh(geometry, material);
+          mesh.position.y = y;
+          mesh.castShadow = true;
+          mesh.userData = { bot, head };
+          group.add(mesh);
+          bot.parts.push(mesh);
+        }
+        bots.push(bot);
+      }
+
+      function blocked(x, z, radius) {
+        return bounds.some(b =>
+          Math.abs(x - b.x) < b.w + radius &&
+          Math.abs(z - b.z) < b.d + radius
+        );
+      }
+
+      function move(position, dx, dz, radius) {
+        if (!blocked(position.x + dx, position.z, radius)) position.x += dx;
+        if (!blocked(position.x, position.z + dz, radius)) position.z += dz;
+      }
+
+      function reset() {
+        for (const bot of bots) scene.remove(bot.group);
+        bots.length = 0;
+        for (const [x, z] of [
+          [-14, -14], [0, -15], [14, -5], [-14, 0], [13, 14]
+        ]) spawnBot(x, z);
+
+        camera.position.set(0, 1.7, 15);
+        camera.rotation.set(0, 0, 0);
+        hp = 100;
+        ammo = 30;
+        reserve = 120;
+        remaining = 90;
+        reload = cooldown = foot = verticalSpeed = 0;
+        damageFlash = hitFlash = recoil = 0;
+        firing = false;
+        finished = false;
+        round++;
+        keys.clear();
+        scene.updateMatrixWorld(true);
+      }
+
+      function end(title, text) {
+        finished = true;
+        active = false;
+        firing = false;
+        keys.clear();
+        $("title").textContent = title;
+        $("message").textContent = text;
+        start.textContent = "Новый раунд";
+        overlay.style.display = "grid";
+        if (document.pointerLockElement === renderer.domElement) {
+          document.exitPointerLock();
+        }
+      }
+
+      function beginReload() {
+        if (!reload && ammo < 30 && reserve > 0) reload = 1.6;
+      }
+
+      function shoot() {
+        if (cooldown > 0 || reload > 0) return;
+        if (ammo === 0) {
+          beginReload();
+          return;
+        }
+        ammo--;
+        cooldown = .115;
+        recoil = .075;
+
+        camera.getWorldDirection(direction);
+        ray.set(camera.position, direction);
+        ray.far = 80;
+        const targets = bots.flatMap(b => b.hp > 0 ? b.parts : []);
+        const hit = ray.intersectObjects([...walls, ...targets], false)[0];
+        const bot = hit?.object.userData.bot;
+        if (bot) {
+          bot.hp -= hit.object.userData.head ? 100 : 34;
+          hitFlash = .12;
+          if (bot.hp <= 0) bot.group.visible = false;
+          if (bots.every(b => b.hp <= 0)) {
+            end("Победа", "Арена зачищена. Все пять ботов уничтожены.");
+          }
+        }
+      }
+
+      start.disabled = false;
+      start.textContent = "Играть";
+
+      start.addEventListener("click", async () => {
+        try {
+          if (finished) reset();
+          await renderer.domElement.requestPointerLock();
+        } catch (error) {
+          $("message").textContent =
+            "Браузер не разрешил захват мыши. Попробуй нажать ещё раз.";
+          console.error(error);
+        }
+      });
+
+      document.addEventListener("pointerlockerror", () => {
+        $("message").textContent =
+          "Захват мыши отклонён. Открой игру в отдельной вкладке и повтори.";
+      });
+
+      document.addEventListener("pointerlockchange", () => {
+        active = document.pointerLockElement === renderer.domElement &&
+          !finished;
+        firing = false;
+        keys.clear();
+        overlay.style.display = active ? "none" : "grid";
+        if (!active && !finished) {
+          $("title").textContent = "Пауза";
+          $("message").textContent = "Нажми, чтобы вернуться в раунд.";
+          start.textContent = "Продолжить";
+        }
+      });
+
+      document.addEventListener("mousemove", event => {
+        if (!active) return;
+        camera.rotation.y -= event.movementX * .002;
+        camera.rotation.x = T.MathUtils.clamp(
+          camera.rotation.x - event.movementY * .002, -1.45, 1.45
+        );
+      });
+
+      document.addEventListener("keydown", event => {
+        if (!active) return;
+        if (["Space", "KeyW", "KeyA", "KeyS", "KeyD"].includes(event.code)) {
+          event.preventDefault();
+        }
+        keys.add(event.code);
+        if (event.code === "KeyR") beginReload();
+        if (event.code === "Space" && !event.repeat && foot === 0) {
+          verticalSpeed = 6;
+        }
+      });
+
+      document.addEventListener("keyup", event => keys.delete(event.code));
+      document.addEventListener("mousedown", event => {
+        if (active && event.button === 0) firing = true;
+      });
+      document.addEventListener("mouseup", event => {
+        if (event.button === 0) firing = false;
+      });
+      window.addEventListener("blur", () => {
+        keys.clear();
+        firing = false;
+        if (document.pointerLockElement === renderer.domElement) {
+          document.exitPointerLock();
+        }
+      });
+      window.addEventListener("resize", () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+
+      function update(dt) {
+        remaining = Math.max(0, remaining - dt);
+        cooldown = Math.max(0, cooldown - dt);
+        recoil = Math.max(0, recoil - dt);
+        hitFlash = Math.max(0, hitFlash - dt);
+        damageFlash = Math.max(0, damageFlash - dt);
+
+        if (reload > 0) {
+          reload = Math.max(0, reload - dt);
+          if (reload === 0) {
+            const amount = Math.min(30 - ammo, reserve);
+            ammo += amount;
+            reserve -= amount;
+          }
+        }
+
+        const crouch = keys.has("KeyC");
+        const speed = crouch ? 2.3 : keys.has("ShiftLeft") ? 7 : 4.5;
+        const movement = new T.Vector3(
+          Number(keys.has("KeyD")) - Number(keys.has("KeyA")),
+          0,
+          Number(keys.has("KeyS")) - Number(keys.has("KeyW"))
+        );
+        if (movement.lengthSq()) {
+          movement.normalize().applyAxisAngle(up, camera.rotation.y);
+          move(camera.position, movement.x * speed * dt,
+            movement.z * speed * dt, .35);
+        }
+
+        verticalSpeed -= 16 * dt;
+        foot = Math.max(0, foot + verticalSpeed * dt);
+        if (foot === 0) verticalSpeed = 0;
+        camera.position.y = foot + (crouch ? 1.05 : 1.7);
+
+        // Refresh transforms before ray tests, not only during rendering.
+        scene.updateMatrixWorld(true);
+        if (firing) shoot();
+        if (finished) return;
+
+        for (const bot of bots) {
+          if (bot.hp <= 0) continue;
+          const position = bot.group.position;
+          const dx = camera.position.x - position.x;
+          const dz = camera.position.z - position.z;
+          const distance = Math.hypot(dx, dz);
+          bot.group.rotation.y = Math.atan2(dx, dz);
+
+          if (distance > 3) {
+            const step = Math.min(2 * dt, distance - 3);
+            const oldX = position.x;
+            const oldZ = position.z;
+            move(position, dx / distance * step,
+              dz / distance * step, .45);
+            if (Math.hypot(position.x - oldX, position.z - oldZ) < step * .2) {
+              move(position, -dz / distance * step * bot.side,
+                dx / distance * step * bot.side, .45);
+            }
+          }
+
+          bot.timer -= dt;
+          if (bot.timer <= 0) {
+            bot.timer = .8 + Math.random() * .7;
+            const origin = position.clone();
+            origin.y = 1.5;
+            const aim = camera.position.clone().sub(origin);
+            const targetDistance = aim.length();
+            ray.set(origin, aim.normalize());
+            ray.far = targetDistance;
+            const obstructed = ray.intersectObjects(walls, false).length > 0;
+            if (!obstructed && targetDistance < 27 && Math.random() < .65) {
+              hp = Math.max(0, hp - 9);
+              damageFlash = .3;
+              if (hp === 0) {
+                end("Поражение", "Боты победили. Используй укрытия и перезарядку.");
+                return;
+              }
+            }
+          }
+        }
+
+        if (remaining === 0) {
+          end("Время вышло", "На зачистку арены даётся 90 секунд.");
+        }
+      }
+
+      let previous = performance.now();
+      function frame(now) {
+        requestAnimationFrame(frame);
+        const dt = Math.min((now - previous) / 1000, .04);
+        previous = now;
+        if (active) update(dt);
+
+        gun.position.z = -.55 + recoil;
+        gun.rotation.x = reload > 0 ? -.35 : recoil;
+        muzzle.visible = active && recoil > .035;
+        $("health").textContent = `HP ${hp}`;
+        $("ammo").textContent = reload > 0
+          ? `ПЕРЕЗАРЯДКА ${reload.toFixed(1)}`
+          : `${ammo} / ${reserve}`;
+        $("score").textContent =
+          `РАУНД ${round} | ${Math.ceil(remaining)} С | ` +
+          `БОТЫ ${bots.filter(b => b.hp > 0).length}/5`;
+        $("crosshair").style.color = hitFlash > 0 ? "#ff765e" : "#bcffb0";
+        $("damage").style.opacity = String(damageFlash * 2);
+        renderer.render(scene, camera);
+      }
+      requestAnimationFrame(frame);
+    }
+  </script>
+</body>
+</html>
